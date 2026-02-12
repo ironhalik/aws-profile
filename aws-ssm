@@ -46,6 +46,11 @@ _ec2_list() {
   _aws_require_cmd jq "Try: brew install jq" || return 1
   _aws_require_cmd aws "Try: brew install awscli" || return 1
 
+  if ! _aws_get_caller_identity >/dev/null 2>&1; then
+    echo "Error: No valid AWS credentials found. Run 'aws-profile <name>' first." >&2
+    return 1
+  fi
+
   local instances
   if ! instances=$(_ec2_describe_instances); then
     echo "Error: Failed to describe instances" >&2
@@ -214,6 +219,11 @@ EOF
       return
       ;;
   esac
+
+  if ! _aws_get_caller_identity >/dev/null 2>&1; then
+    echo "Error: No valid AWS credentials found. Run 'aws-profile <name>' first." >&2
+    return 1
+  fi
 
   local target
 
