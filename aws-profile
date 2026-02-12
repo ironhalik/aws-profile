@@ -1,0 +1,93 @@
+# vim: set ft=bash :
+# Requires: aws-common (sourced first via alphabetical ordering)
+
+aws-profile() {
+  case "${1:-}" in
+    -h|--help)
+      echo "Usage: aws-profile [--clear | profile-name]"
+      echo "  No args:     Print current AWS_PROFILE"
+      echo "  --clear:     Unset all AWS environment variables"
+      echo "  profile-name: Switch to the given profile"
+      echo ""
+      echo "If the profile has mfa_serial and mfa_otp_path configured,"
+      echo "a session token is automatically obtained via 1Password."
+      return 0
+      ;;
+    --clear)
+      aws-clear
+      return
+      ;;
+    "")
+      echo "${AWS_PROFILE:-<not set>}"
+      return 0
+      ;;
+  esac
+
+  local profile="${1}"
+
+  if ! _aws_profile_exists "${profile}"; then
+    echo "Error: Profile '${profile}' not found" >&2
+    echo "Available profiles:" >&2
+    _aws_get_profiles | sed 's/^/  /' >&2
+    return 1
+  fi
+
+  export AWS_PROFILE="${profile}"
+
+  # Set region from profile if not already overridden
+  if [[ -z "${AWS_REGION:-}" ]]; then
+    local region
+    region=$(_aws_get_profile_value "${profile}" region)
+    [[ -n "${region}" ]] && export AWS_REGION="${region}"
+  fi
+
+  # Auto-MFA via 1Password if configured
+  local mfa_serial mfa_otp_path
+  mfa_serial=$(_aws_get_profile_value "${profile}" mfa_serial)
+  mfa_otp_path=$(_aws_get_profile_value "${profile}" mfa_otp_path)
+
+  if [[ -n "${mfa_serial}" && -n "${mfa_otp_path}" ]]; then
+    # Validate 1Password reference format before passing to op
+    if [[ ! "${mfa_otp_path}" =~ ^op://[a-zA-Z0-9/_.\ -]+$ ]]; then
+      echo "Error: Invalid mfa_otp_path format: '${mfa_otp_path}'" >&2
+      return 1
+    fi
+
+    _aws_require_cmd op "Try: brew install --cask 1password-cli" || return 1
+    _aws_require_cmd jq "Try: brew install jq" || return 1
+
+    local identity_line _arn user account
+    if ! identity_line=$(_aws_get_caller_identity); then
+      return 1
+    fi
+
+    IFS=$'\t' read -r _arn user account <<<"${identity_line}"
+
+    local token
+    if ! token=$(op read "${mfa_otp_path}?attribute=otp"); then
+      echo "Error: Failed to read MFA token from 1Password" >&2
+      return 1
+    fi
+
+    _aws_get_session_token \
+      "arn:aws:iam::${account}:mfa/${user}" \
+      "${token}"
+  fi
+}
+
+if _aws_is_zsh; then
+  _aws-profile-completion() {
+    local profiles
+    profiles=$(_aws_get_profiles)
+    local -a completions=(${=profiles} --clear --help)
+    _describe 'aws-profile' completions
+  }
+  compdef _aws-profile-completion aws-profile
+else
+  _aws-profile-completion() {
+    local profiles
+    profiles=$(_aws_get_profiles)
+    mapfile -t COMPREPLY < <(compgen -W "${profiles} --clear --help" -- "${COMP_WORDS[${COMP_CWORD}]}")
+  }
+  complete -F _aws-profile-completion aws-profile
+fi

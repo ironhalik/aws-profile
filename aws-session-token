@@ -1,0 +1,106 @@
+# vim: set ft=bash :
+# Requires: aws-common (sourced first via alphabetical ordering)
+
+aws-session-token() {
+  local profile="" token=""
+  local -a positional=()
+
+  _ast_usage() {
+    cat <<'EOF'
+Obtain an AWS STS session token with MFA.
+
+Usage:
+  aws-session-token --profile <profile> --token <otp>
+  aws-session-token <profile> <otp>
+  AWS_PROFILE=<profile> aws-session-token --token <otp>
+  AWS_PROFILE=<profile> aws-session-token <otp>
+EOF
+  }
+
+  while [[ $# -gt 0 ]]; do
+    case "${1}" in
+      -p|--profile) shift; profile="${1:-}" ;;
+      -t|--token)   shift; token="${1:-}" ;;
+      -h|--help)    _ast_usage; return 0 ;;
+      -*)           echo "Error: Unknown option '${1}'" >&2; _ast_usage >&2; return 1 ;;
+      *)            positional+=("${1}") ;;
+    esac
+    shift
+  done
+
+  if [[ ${#positional[@]} -gt 2 ]]; then
+    echo "Error: Too many arguments" >&2
+    _ast_usage >&2
+    return 1
+  fi
+
+  # Resolve positional args: [profile] <token>
+  if [[ -n "${profile}" && -z "${token}" && ${#positional[@]} -ge 1 ]]; then
+    token="${positional[0]}"
+  elif [[ -z "${profile}" && -z "${token}" ]]; then
+    profile="${positional[0]:-}"
+    token="${positional[1]:-}"
+  fi
+
+  profile="${profile:-${AWS_PROFILE:-}}"
+
+  if [[ -z "${profile}" ]]; then
+    echo "Error: Missing AWS profile. Provide via AWS_PROFILE or --profile" >&2
+    return 1
+  fi
+  if [[ -z "${token}" ]]; then
+    echo "Error: Missing MFA token. Provide via --token" >&2
+    return 1
+  fi
+
+  _aws_require_cmd jq "Try: brew install jq" || return 1
+  _aws_require_cmd aws "Try: brew install awscli" || return 1
+
+  local identity_line _arn user account
+  if ! identity_line=$(_aws_get_caller_identity "${profile}"); then
+    return 1
+  fi
+
+  IFS=$'\t' read -r _arn user account <<<"${identity_line}"
+
+  export AWS_PROFILE="${profile}"
+
+  _aws_get_session_token \
+    "arn:aws:iam::${account}:mfa/${user}" \
+    "${token}" \
+    "${profile}"
+}
+
+if _aws_is_zsh; then
+  _aws-session-token-completion() {
+    local prev="${words[$(( CURRENT - 1 ))]}"
+    case "${prev}" in
+      -p|--profile)
+        local profiles
+        profiles=$(_aws_get_profiles)
+        local -a completions=(${=profiles})
+        _describe 'profile' completions
+        ;;
+      *)
+        local -a completions=(--profile --token --help)
+        _describe 'option' completions
+        ;;
+    esac
+  }
+  compdef _aws-session-token-completion aws-session-token
+else
+  _aws-session-token-completion() {
+    local prev="${COMP_WORDS[COMP_CWORD-1]}"
+    case "${prev}" in
+      -p|--profile)
+        local profiles
+        profiles=$(_aws_get_profiles)
+        mapfile -t COMPREPLY < <(compgen -W "${profiles}" -- "${COMP_WORDS[${COMP_CWORD}]}")
+        ;;
+      *)
+        mapfile -t COMPREPLY < <(compgen -W "--profile --token --help" -- "${COMP_WORDS[${COMP_CWORD}]}")
+        ;;
+    esac
+  }
+  complete -F _aws-session-token-completion aws-session-token
+fi

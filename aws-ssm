@@ -1,0 +1,253 @@
+# vim: set ft=bash :
+# shellcheck shell=bash
+# Requires: aws-common (sourced first via alphabetical ordering)
+# EC2 instance listing and SSM session management
+
+_ec2_describe_instances() {
+  # Returns JSON array of running/pending/stopped instances.
+  # Sorted by LaunchTime descending (newest first) via JMESPath.
+  # Uses bkt for caching when available (brew install bkt).
+  # Pass --cached to allow cached results (used by completion and find).
+  # Without --cached, always fetches fresh data (used by list).
+  local use_cache=false
+  if [[ "${1:-}" == "--cached" ]]; then
+    use_cache=true
+  fi
+
+  # shellcheck disable=SC2016
+  local -a cmd=(
+    aws ec2 describe-instances
+    --filters "Name=instance-state-name,Values=pending,running,shutting-down,stopping,stopped"
+    --query 'Reservations[*].Instances[*].{
+      Name: Tags[?Key==`Name`]|[0].Value,
+      InstanceId: InstanceId,
+      PrivateIp: PrivateIpAddress,
+      PublicIp: PublicIpAddress,
+      Type: InstanceType,
+      State: State.Name,
+      LaunchTime: LaunchTime
+    } | [] | reverse(sort_by(@, &LaunchTime))'
+    --output json
+  )
+
+  if [[ "${use_cache}" == true ]] && command -v bkt >/dev/null 2>&1; then
+    bkt --ttl=5m --stale=1m --env AWS_PROFILE --env AWS_REGION -- "${cmd[@]}"
+  else
+    if command -v bkt >/dev/null 2>&1; then
+      # Warm the cache for subsequent tab-complete / find calls
+      bkt --ttl=5m --stale=1m --env AWS_PROFILE --env AWS_REGION --force -- "${cmd[@]}"
+    else
+      "${cmd[@]}"
+    fi
+  fi
+}
+
+_ec2_list() {
+  _aws_require_cmd jq "Try: brew install jq" || return 1
+  _aws_require_cmd aws "Try: brew install awscli" || return 1
+
+  local instances
+  if ! instances=$(_ec2_describe_instances); then
+    echo "Error: Failed to describe instances" >&2
+    return 1
+  fi
+
+  local count
+  count=$(jq 'length' <<<"${instances}")
+
+  if [[ "${count}" -eq 0 ]]; then
+    echo "No instances found."
+    return 0
+  fi
+
+  local profile="${AWS_PROFILE:-default}"
+  local region="${AWS_REGION:-$(aws configure get region 2>/dev/null || echo 'us-east-1')}"
+  echo "Instances in ${profile} / ${region} (${count} total, newest first):"
+  echo ""
+
+  # Parse rows into an array so we can measure column widths before printing
+  local -a rows=()
+  local name iid pip eip itype state launch
+  while IFS=$'\t' read -r name iid pip eip itype state launch; do
+    launch="${launch/T/ }"
+    launch="${launch%%+*}"
+    rows+=("${name}"$'\t'"${iid}"$'\t'"${pip}"$'\t'"${eip}"$'\t'"${itype}"$'\t'"${state}"$'\t'"${launch}")
+  done < <(jq -r '.[] | [.Name // "—", .InstanceId, .PrivateIp // "—", .PublicIp // "—", .Type, .State, .LaunchTime] | @tsv' <<<"${instances}")
+
+  # Column min widths (header length)
+  local -a headers=("NAME" "INSTANCE ID" "PRIVATE IP" "PUBLIC IP" "TYPE" "STATE" "LAUNCHED")
+  local -a widths=()
+  local i
+  for i in "${!headers[@]}"; do
+    widths[i]=${#headers[i]}
+  done
+
+  # Expand widths to fit data
+  local row val
+  for row in "${rows[@]}"; do
+    if _aws_is_zsh; then
+      IFS=$'\t' read -rA cols <<<"${row}"
+    else
+      IFS=$'\t' read -r -a cols <<<"${row}"
+    fi
+    for i in "${!cols[@]}"; do
+      val="${cols[${i}]}"
+      (( ${#val} > widths[i] )) && widths[i]=${#val}
+    done
+  done
+
+  # Build format string: pad all columns except the last (LAUNCHED)
+  local fmt="  "
+  for i in "${!headers[@]}"; do
+    if (( i < ${#headers[@]} - 1 )); then
+      fmt+="%-$((widths[i] + 2))s"
+    else
+      fmt+="%s"
+    fi
+  done
+  fmt+="\n"
+
+  # Header + separator
+  # shellcheck disable=SC2059
+  printf "${fmt}" "${headers[@]}"
+  local -a dashes=()
+  for i in "${!headers[@]}"; do
+    dashes+=("$(printf '%*s' "${widths[${i}]}" '' | tr ' ' '-')")
+  done
+  # shellcheck disable=SC2059
+  printf "${fmt}" "${dashes[@]}"
+
+  # Rows with color-coded state
+  local color reset
+  reset=$'\033[0m'
+  for row in "${rows[@]}"; do
+    IFS=$'\t' read -r name iid pip eip itype state launch <<<"${row}"
+    case "${state}" in
+      running)  color=$'\033[32m' ;;
+      stopped)  color=$'\033[31m' ;;
+      *)        color=$'\033[33m' ;;
+    esac
+
+    # Build per-row format with color injected into the STATE column
+    local rfmt="  "
+    for i in "${!headers[@]}"; do
+      if (( i == 5 )); then
+        rfmt+="${color}%-$((widths[i] + 2))s${reset}"
+      elif (( i < ${#headers[@]} - 1 )); then
+        rfmt+="%-$((widths[i] + 2))s"
+      else
+        rfmt+="%s"
+      fi
+    done
+    rfmt+="\n"
+
+    # shellcheck disable=SC2059
+    printf "${rfmt}" "${name}" "${iid}" "${pip}" "${eip}" "${itype}" "${state}" "${launch}"
+  done
+}
+
+_ec2_find_instance() {
+  # Find instance ID matching a search term. Returns newest match.
+  local search="${1}"
+
+  _aws_require_cmd jq "Try: brew install jq" || return 1
+  _aws_require_cmd aws "Try: brew install awscli" || return 1
+
+  local instances
+  if ! instances=$(_ec2_describe_instances --cached); then
+    echo "Error: Failed to describe instances" >&2
+    return 1
+  fi
+
+  # Filter: match against Name, InstanceId, or PrivateIp (case-insensitive)
+  local matches
+  matches=$(jq -r --arg s "${search}" '
+    [.[] | select(
+      (.Name // "" | ascii_downcase | contains($s | ascii_downcase)) or
+      (.InstanceId | ascii_downcase | contains($s | ascii_downcase)) or
+      (.PrivateIp // "" | contains($s))
+    )]' <<<"${instances}")
+
+  local count
+  count=$(jq 'length' <<<"${matches}")
+
+  if [[ "${count}" -eq 0 ]]; then
+    echo "Error: No instances matching '${search}'" >&2
+    return 1
+  fi
+
+  # Already sorted newest-first by _ec2_describe_instances, take first
+  local name iid state
+  name=$(jq -r '.[0].Name // "—"' <<<"${matches}")
+  iid=$(jq -r '.[0].InstanceId' <<<"${matches}")
+  state=$(jq -r '.[0].State' <<<"${matches}")
+
+  if [[ "${state}" != "running" ]]; then
+    echo "Warning: ${name} (${iid}) is ${state}" >&2
+    read -r -p "Connect anyway? [y/N] " confirm
+    [[ "${confirm}" =~ ^[Yy]$ ]] || return 1
+  fi
+
+  if [[ "${count}" -gt 1 ]]; then
+    echo "Matched ${count} instances, using newest: ${name} (${iid})" >&2
+  else
+    echo "Connecting to ${name} (${iid})" >&2
+  fi
+
+  echo "${iid}"
+}
+
+ssm() {
+  case "${1:-}" in
+    -h|--help)
+      cat <<'EOF'
+Usage: ssm [search-term | instance-id]
+  No args:       List all instances (newest first)
+  i-xxx:         Connect directly to instance ID
+  search-term:   Fuzzy match against Name, Instance ID, or IP
+                 Connects to the newest match if multiple found
+EOF
+      return 0
+      ;;
+    "")
+      _ec2_list
+      return
+      ;;
+  esac
+
+  local target
+
+  if [[ "${1}" == i-* ]]; then
+    target="${1}"
+    echo "Connecting to ${target}"
+  else
+    target=$(_ec2_find_instance "${1}") || return 1
+  fi
+
+  aws ssm start-session --target "${target}"
+}
+
+if _aws_is_zsh; then
+  _ssm_completion() {
+    if [[ ${CURRENT} -eq 2 ]]; then
+      local instances
+      instances=$(_ec2_describe_instances --cached 2>/dev/null) || return
+      local -a completions
+      completions=(${(f)"$(jq -r '.[] | (.Name // empty), .InstanceId' <<<"${instances}" 2>/dev/null | sort -u)"})
+      completions+=(--help)
+      _describe 'instance' completions
+    fi
+  }
+  compdef _ssm_completion ssm
+else
+  _ssm_completion() {
+    if [[ "${COMP_CWORD}" -eq 1 ]]; then
+      local instances
+      instances=$(_ec2_describe_instances --cached 2>/dev/null) || return
+      local completions
+      completions=$(jq -r '.[] | (.Name // empty), .InstanceId' <<<"${instances}" 2>/dev/null | sort -u)
+      mapfile -t COMPREPLY < <(compgen -W "${completions} --help" -- "${COMP_WORDS[${COMP_CWORD}]}")
+    fi
+  }
+  complete -F _ssm_completion ssm
+fi

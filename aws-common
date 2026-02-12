@@ -1,0 +1,117 @@
+# vim: set ft=bash :
+# Shared AWS helper functions
+# Sourced before aws-profile and aws-session-token
+
+_aws_is_zsh() {
+  [[ -n "${ZSH_VERSION:-}" ]]
+}
+
+_aws_config_file() {
+  echo "${AWS_CONFIG_FILE:-${HOME}/.aws/config}"
+}
+
+_aws_get_profiles() {
+  local aws_config
+  aws_config=$(_aws_config_file)
+  [[ -f "${aws_config}" ]] || return 1
+  sed -n 's/^\[profile \(.*\)\]/\1/p' "${aws_config}"
+}
+
+_aws_get_profile_value() {
+  local profile="${1}" key="${2}" aws_config escaped_profile
+  aws_config=$(_aws_config_file)
+  [[ -f "${aws_config}" ]] || return 1
+
+  # shellcheck disable=SC2016
+  escaped_profile=$(printf '%s\n' "${profile}" | sed 's/[].[\/*^$()+?{|]/\\&/g')
+  sed -n "/^\[profile ${escaped_profile}\]/,/^\[/{/^\[/d; /^$/d; p;}" "${aws_config}" \
+    | grep -w "${key}" \
+    | cut -d '=' -f 2- \
+    | tail -1 \
+    | xargs
+}
+
+_aws_profile_exists() {
+  local profile="${1}"
+  _aws_get_profiles | grep -qxF "${profile}"
+}
+
+_aws_require_cmd() {
+  local cmd="${1}" hint="${2:-}"
+  if ! command -v "${cmd}" >/dev/null 2>&1; then
+    echo "Error: ${cmd} is required but not installed${hint:+. ${hint}}" >&2
+    return 1
+  fi
+}
+
+_aws_get_caller_identity() {
+  local profile_arg="${1:-}"
+  local caller_data
+
+  _aws_require_cmd jq "Try: brew install jq" || return 1
+  _aws_require_cmd aws "Try: brew install awscli" || return 1
+
+  local -a cmd=(aws)
+  [[ -n "${profile_arg}" ]] && cmd+=(--profile="${profile_arg}")
+  cmd+=(sts get-caller-identity)
+
+  if ! caller_data=$("${cmd[@]}"); then
+    echo "Error: Failed to get caller identity" >&2
+    return 1
+  fi
+
+  local arn account user
+  arn=$(jq -r '.Arn // empty' <<<"${caller_data}") || return 1
+  account=$(jq -r '.Account // empty' <<<"${caller_data}") || return 1
+
+  if [[ -z "${arn}" || -z "${account}" ]]; then
+    echo "Error: Unexpected response from sts get-caller-identity" >&2
+    return 1
+  fi
+
+  user=$(basename "${arn}")
+
+  # Output as tab-separated for easy read: arn, user, account
+  printf '%s\t%s\t%s\n' "${arn}" "${user}" "${account}"
+}
+
+_aws_get_session_token() {
+  local serial_number="${1}" token_code="${2}"
+  local -a profile_args=()
+  [[ -n "${3:-}" ]] && profile_args=(--profile="${3}")
+
+  local sts_credentials
+  if ! sts_credentials=$(aws "${profile_args[@]}" sts get-session-token \
+      --serial-number "${serial_number}" \
+      --token-code "${token_code}"); then
+    echo "Error: Failed to get session token" >&2
+    return 1
+  fi
+
+  # Validate that we got real credentials back
+  local ak sk st expiration
+  ak=$(jq -r '.Credentials.AccessKeyId // empty' <<<"${sts_credentials}")
+  sk=$(jq -r '.Credentials.SecretAccessKey // empty' <<<"${sts_credentials}")
+  st=$(jq -r '.Credentials.SessionToken // empty' <<<"${sts_credentials}")
+  expiration=$(jq -r '.Credentials.Expiration // empty' <<<"${sts_credentials}")
+
+  if [[ -z "${ak}" || -z "${sk}" || -z "${st}" ]]; then
+    echo "Error: Received incomplete credentials" >&2
+    return 1
+  fi
+
+  export AWS_ACCESS_KEY_ID="${ak}"
+  export AWS_SECRET_ACCESS_KEY="${sk}"
+  export AWS_SESSION_TOKEN="${st}"
+
+  if [[ -n "${expiration}" ]]; then
+    echo "Session established. Expires: ${expiration}"
+  else
+    echo "Session established."
+  fi
+}
+
+aws-clear() {
+  unset AWS_PROFILE AWS_REGION AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+  echo "AWS environment cleared."
+}
