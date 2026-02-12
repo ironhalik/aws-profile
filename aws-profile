@@ -82,7 +82,7 @@ if _aws_is_zsh; then
     local -a completions=(${=profiles} --clear --help)
     _describe 'aws-profile' completions
   }
-  compdef _aws-profile-completion aws-profile
+  (( $+functions[compdef] )) && compdef _aws-profile-completion aws-profile
 else
   _aws-profile-completion() {
     local profiles

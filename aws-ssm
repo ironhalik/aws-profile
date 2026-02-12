@@ -43,6 +43,9 @@ _ec2_describe_instances() {
 }
 
 _ec2_list() {
+  # Enable 0-indexed arrays in zsh for consistent bash/zsh behavior
+  _aws_is_zsh && setopt localoptions KSH_ARRAYS
+
   _aws_require_cmd jq "Try: brew install jq" || return 1
   _aws_require_cmd aws "Try: brew install awscli" || return 1
 
@@ -83,7 +86,7 @@ _ec2_list() {
   local -a headers=("NAME" "INSTANCE ID" "PRIVATE IP" "PUBLIC IP" "TYPE" "STATE" "LAUNCHED")
   local -a widths=()
   local i
-  for i in "${!headers[@]}"; do
+  for (( i = 0; i < ${#headers[@]}; i++ )); do
     widths[i]=${#headers[i]}
   done
 
@@ -95,7 +98,7 @@ _ec2_list() {
     else
       IFS=$'\t' read -r -a cols <<<"${row}"
     fi
-    for i in "${!cols[@]}"; do
+    for (( i = 0; i < ${#cols[@]}; i++ )); do
       val="${cols[${i}]}"
       (( ${#val} > widths[i] )) && widths[i]=${#val}
     done
@@ -103,7 +106,7 @@ _ec2_list() {
 
   # Build format string: pad all columns except the last (LAUNCHED)
   local fmt="  "
-  for i in "${!headers[@]}"; do
+  for (( i = 0; i < ${#headers[@]}; i++ )); do
     if (( i < ${#headers[@]} - 1 )); then
       fmt+="%-$((widths[i] + 2))s"
     else
@@ -116,7 +119,7 @@ _ec2_list() {
   # shellcheck disable=SC2059
   printf "${fmt}" "${headers[@]}"
   local -a dashes=()
-  for i in "${!headers[@]}"; do
+  for (( i = 0; i < ${#headers[@]}; i++ )); do
     dashes+=("$(printf '%*s' "${widths[${i}]}" '' | tr ' ' '-')")
   done
   # shellcheck disable=SC2059
@@ -135,7 +138,7 @@ _ec2_list() {
 
     # Build per-row format with color injected into the STATE column
     local rfmt="  "
-    for i in "${!headers[@]}"; do
+    for (( i = 0; i < ${#headers[@]}; i++ )); do
       if (( i == 5 )); then
         rfmt+="${color}%-$((widths[i] + 2))s${reset}"
       elif (( i < ${#headers[@]} - 1 )); then
@@ -248,7 +251,7 @@ if _aws_is_zsh; then
       _describe 'instance' completions
     fi
   }
-  compdef _ssm_completion ssm
+  (( $+functions[compdef] )) && compdef _ssm_completion ssm
 else
   _ssm_completion() {
     if [[ "${COMP_CWORD}" -eq 1 ]]; then

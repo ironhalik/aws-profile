@@ -87,7 +87,7 @@ if _aws_is_zsh; then
         ;;
     esac
   }
-  compdef _aws-session-token-completion aws-session-token
+  (( $+functions[compdef] )) && compdef _aws-session-token-completion aws-session-token
 else
   _aws-session-token-completion() {
     local prev="${COMP_WORDS[COMP_CWORD-1]}"
