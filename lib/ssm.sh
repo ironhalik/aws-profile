@@ -1,6 +1,6 @@
 # vim: set ft=bash :
 # shellcheck shell=bash
-# Requires: aws-common (sourced first via alphabetical ordering)
+# Requires: lib/common.sh (sourced first by ../aws-profile)
 # EC2 instance listing and SSM session management
 
 _ec2_describe_instances() {
@@ -192,7 +192,9 @@ _ec2_find_instance() {
 
   if [[ "${state}" != "running" ]]; then
     echo "Warning: ${name} (${iid}) is ${state}" >&2
-    read -r -p "Connect anyway? [y/N] " confirm
+    local confirm
+    printf 'Connect anyway? [y/N] ' >&2  # zsh's read -p means coprocess, not prompt
+    read -r confirm
     [[ "${confirm}" =~ ^[Yy]$ ]] || return 1
   fi
 

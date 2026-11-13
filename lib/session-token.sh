@@ -1,7 +1,9 @@
 # vim: set ft=bash :
-# Requires: aws-common (sourced first via alphabetical ordering)
+# Requires: lib/common.sh (sourced first by ../aws-profile)
 
 aws-session-token() {
+  # 0-indexed arrays in zsh, same as bash
+  _aws_is_zsh && setopt localoptions KSH_ARRAYS
   local profile="" token=""
   local -a positional=()
 
@@ -28,18 +30,22 @@ EOF
     shift
   done
 
-  if [[ ${#positional[@]} -gt 2 ]]; then
+  # Positionals ([profile] <token>) fill whatever the flags left empty
+  if [[ ${#positional[@]} -eq 2 && -z "${profile}" ]]; then
+    profile="${positional[0]}"
+    positional=("${positional[1]}")
+  fi
+  if [[ ${#positional[@]} -eq 1 && -z "${token}" ]]; then
+    token="${positional[0]}"
+    positional=()
+  elif [[ ${#positional[@]} -eq 1 && -z "${profile}" ]]; then
+    profile="${positional[0]}"
+    positional=()
+  fi
+  if [[ ${#positional[@]} -gt 0 ]]; then
     echo "Error: Too many arguments" >&2
     _ast_usage >&2
     return 1
-  fi
-
-  # Resolve positional args: [profile] <token>
-  if [[ -n "${profile}" && -z "${token}" && ${#positional[@]} -ge 1 ]]; then
-    token="${positional[0]}"
-  elif [[ -z "${profile}" && -z "${token}" ]]; then
-    profile="${positional[0]:-}"
-    token="${positional[1]:-}"
   fi
 
   profile="${profile:-${AWS_PROFILE:-}}"

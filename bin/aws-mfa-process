@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# vim: set ft=bash:
+# AWS credential_process helper: MFA session token from a 1Password item, cached until near expiry.
+#
+#   [profile foo]
+#   credential_process = /path/to/bin/aws-mfa-process "op://Vault/Item"
+#
+# The item needs fields: "Access Key ID", "Secret Access Key", "MFA Serial", "one-time password".
+# stdout must be the credentials JSON only; everything else goes to stderr.
+set -euo pipefail
+
+# GUI apps get launchd's minimal PATH
+PATH="${PATH}:/opt/homebrew/bin:/usr/local/bin"
+
+# shellcheck source=../lib/common.sh
+source "$(dirname "$0")/../lib/common.sh"
+
+item="${1:?Usage: aws-mfa-process op://<vault>/<item>}"
+key="${item#op://}"
+hash=$(printf '%s' "${item}" | shasum | cut -c1-8)  # readable name alone can collide
+cache="${HOME}/.aws/cli/cache/mfa-${key//[^A-Za-z0-9]/-}-${hash}.json"
+lock="${cache}.lock"
+
+_aws_require_cmd jq "Try: brew install jq"
+_aws_require_cmd aws "Try: brew install awscli"
+
+# Reuse cached credentials until 15 minutes before expiry, where botocore starts refreshing
+cache_valid() {
+  [[ -f "${cache}" ]] && jq -e '(.Expiration | sub("(\\.[0-9]+)?(\\+00:00|Z)$"; "Z") | fromdateiso8601) > now + 900' \
+    "${cache}" >/dev/null 2>&1
+}
+
+if cache_valid; then
+  cat "${cache}"
+  exit 0
+fi
+
+umask 077
+mkdir -p "$(dirname "${cache}")"
+
+# Serialise refreshes: parallel callers would reuse one TOTP code, which STS rejects.
+# A lock older than 2 minutes is from a killed process and gets taken over.
+have_lock=""
+for (( i = 0; i < 900; i++ )); do
+  mkdir "${lock}" 2>/dev/null && { have_lock=1; break; }
+  [[ -z $(find "${lock}" -maxdepth 0 -mmin +2 2>/dev/null) ]] || rmdir "${lock}" 2>/dev/null || true
+  sleep 0.2
+done
+if [[ -z "${have_lock}" ]]; then
+  echo "Error: timed out waiting for ${lock}" >&2
+  exit 1
+fi
+tmp=""
+trap '[[ -z "${tmp}" ]] || rm -f "${tmp}"; rmdir "${lock}" 2>/dev/null || true' EXIT
+
+# Another caller may have refreshed while we waited
+if cache_valid; then
+  cat "${cache}"
+  exit 0
+fi
+
+_aws_require_cmd op "Try: brew install --cask 1password-cli"
+
+# Long-term keys go in via env rather than a profile, so this can't recurse into credential_process
+AWS_ACCESS_KEY_ID=$(op read "${item}/Access Key ID")
+AWS_SECRET_ACCESS_KEY=$(op read "${item}/Secret Access Key")
+export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
+unset AWS_SESSION_TOKEN AWS_PROFILE
+mfa_serial=$(op read "${item}/MFA Serial")
+token=$(op read "${item}/one-time password?attribute=otp")
+
+tmp=$(mktemp "${cache}.XXXXXX")
+# Session tokens from any regional STS endpoint work everywhere
+aws --region us-east-1 --output json sts get-session-token \
+    --serial-number "${mfa_serial}" --token-code "${token}" \
+  | jq '.Credentials | {Version: 1, AccessKeyId, SecretAccessKey, SessionToken, Expiration}' >"${tmp}"
+mv "${tmp}" "${cache}"
+cat "${cache}"

@@ -1,6 +1,6 @@
 # vim: set ft=bash :
 # Shared AWS helper functions
-# Sourced before aws-profile and aws-session-token
+# Sourced first by ../aws-profile, and by bin/aws-mfa-process
 
 _aws_is_zsh() {
   [[ -n "${ZSH_VERSION:-}" ]]
@@ -10,11 +10,15 @@ _aws_config_file() {
   echo "${AWS_CONFIG_FILE:-${HOME}/.aws/config}"
 }
 
+# Config sections ([default], [profile X]) plus credentials-file sections ([X])
 _aws_get_profiles() {
-  local aws_config
+  local aws_config aws_creds
   aws_config=$(_aws_config_file)
-  [[ -f "${aws_config}" ]] || return 1
-  sed -n 's/^\[profile \(.*\)\]/\1/p' "${aws_config}"
+  aws_creds="${AWS_SHARED_CREDENTIALS_FILE:-${HOME}/.aws/credentials}"
+  {
+    [[ ! -f "${aws_config}" ]] || sed -n -e 's/^\[profile \(.*\)\]/\1/p' -e 's/^\[\(default\)\]/\1/p' "${aws_config}"
+    [[ ! -f "${aws_creds}" ]] || sed -n 's/^\[\(.*\)\]/\1/p' "${aws_creds}"
+  } | sort -u
 }
 
 _aws_get_profile_value() {
@@ -24,7 +28,9 @@ _aws_get_profile_value() {
 
   # shellcheck disable=SC2016
   escaped_profile=$(printf '%s\n' "${profile}" | sed 's/[].[\/*^$()+?{|]/\\&/g')
-  sed -n "/^\[profile ${escaped_profile}\]/,/^\[/{/^\[/d; /^$/d; p;}" "${aws_config}" \
+  local section="profile ${escaped_profile}"
+  [[ "${profile}" == default ]] && section=default
+  sed -n "/^\[${section}\]/,/^\[/{/^\[/d; /^$/d; p;}" "${aws_config}" \
     | grep -w "${key}" \
     | cut -d '=' -f 2- \
     | tail -1 \
@@ -53,7 +59,7 @@ _aws_get_caller_identity() {
 
   local -a cmd=(aws)
   [[ -n "${profile_arg}" ]] && cmd+=(--profile="${profile_arg}")
-  cmd+=(sts get-caller-identity)
+  cmd+=(--output json sts get-caller-identity)
 
   if ! caller_data=$("${cmd[@]}"); then
     echo "Error: Failed to get caller identity" >&2
@@ -81,7 +87,7 @@ _aws_get_session_token() {
   [[ -n "${3:-}" ]] && profile_args=(--profile="${3}")
 
   local sts_credentials
-  if ! sts_credentials=$(aws "${profile_args[@]}" sts get-session-token \
+  if ! sts_credentials=$(aws "${profile_args[@]}" --output json sts get-session-token \
       --serial-number "${serial_number}" \
       --token-code "${token_code}"); then
     echo "Error: Failed to get session token" >&2
